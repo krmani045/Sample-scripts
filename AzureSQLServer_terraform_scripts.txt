@@ -1,0 +1,160 @@
+# variable "azsqlms_sql_audit_storage_key" {
+#   type = string
+#   description = "Sql Audit Storage account Access keys"
+#   default = null
+# }
+
+variable "sql_contributor" {
+    type = any
+    description = "Sql Resource Group Roles"
+    default = null
+}
+module "sql_resource_group" {
+    source   = "../templates/modules/common/resource_group"
+    name     = "${var.app_name}-${var.environment}-sql-rg"
+    location = var.location
+    environment_variables    = module.environment_variables.values
+    # role_assignments = var.sql_contributor
+}
+module "failover_resource_group_module" {
+    source   = "../templates/modules/common/resource_group"
+    name     = "${var.app_name}-${var.environment}-sql-failover-rg"
+    location = "canadaeast"
+    environment_variables    = module.environment_variables.values
+}
+
+module "failover_storage_account" {
+    source                   = "../templates/modules/storage/storage_account"
+    name                     = "azsqlmsdlspaas${var.environment}sqlfgstrg"
+    resource_group_name      = module.failover_resource_group_module.name
+    location                 = module.failover_resource_group_module.location
+    account_tier             = "Standard"
+    account_replication_type = "LRS"
+    environment_variables    = module.environment_variables.values
+
+    network_rules = {
+        default_action = "Allow" # (Optional) Specifies the default action of Allow or Deny when no other rules match.  Valid options are Deny or Allow.  Defaults to Deny.
+        bypass   = ["AzureServices"]    # (Optional) A set specifying the type(s) of traffic that will bypass this rule.  Can be one or more of: Logging, Metrics, AzureServices and None.  If unspecified, a default of AzureServices will be used.
+        # ip_rules = ["165.225.208.0/23"] # (Optional) A list of public IPs/IP ranges in CIDR format (IPv4 only).  Private IP address ranges (ref: RFC 1918) are not allowed.  At the very least, the Manulife Desktop CIDR range (165.225.208.0/23, zscaler *Toronto III location only*) will be used, to help prevent access post-deployment Storage Account access issues in Azure Portal, as well as permissions issues during pipeline operations.  To find the correct CIDR for your infrastructure, please visit the zscaler Cloud Enforcement Node Ranges site at https://config.zscaler.com/zscaler.net/cenr.
+        # virtual_network_subnet_ids = ["/subscriptions/ecdead0a-5804-475d-8e57-123d2be04/resourceGroups/CAC-azsqlmsDLNAP-Production-network/providers/Microsoft.Network/virtualNetworks/VNET-CAC-azsqlmsDLNAP-Production-PaaS-01/subnets/PrivateEndPoint-Prod"]        # (Optional) A list of resource IDs for subnets.   If unspecified, the Azure default will be used.
+    }
+    private_endpoints = [{
+        name            = "${var.app_name}-${var.environment}-pe-sab"
+        existing_subnet = {
+            virtual_network_name = "VNET-CAE-azsqlmsDLNAP-Production-PaaS-01"
+            subnet_name          = "PrivateEndPoint-Prod"
+            resource_group_name  = "CAE-azsqlmsDLNAP-Production-network"
+        }    
+        private_service_connections = [{
+            name              = "${var.app_name}-${var.environment}-pe-psvc" # name of the Private Service Connection;
+            subresource_names = ["blob"]               # (Optional) a list of subresource names that the private endpoint can connect to;
+        }]
+
+        private_dns_zone_groups = [{
+            name = "mife_core.blob.core.windows.net"
+        }]
+    }]
+}
+
+# module "key_vault_lookup_synapse_secret" {
+#   source              = "../templates/modules/management_tools/key_vault_lookup"
+#   name                = module.generic_key_vault.name
+#   resource_group_name = module.resource_group.name
+#   secret_names        = ["azsqlms-sql-secret"]
+# }
+
+module "sql_server" {
+    source                       = "../templates/modules/databases/sql_server"
+    location                     = module.sql_resource_group.location
+    resource_group_name          = module.sql_resource_group.name
+    name                         = lower("${var.app_name}-${var.environment}-sql")
+    administrator_login          = "azsqlms-sql-admin"   # The administrator login name for the new server. Changing this forces a new resource to be created
+    ad_administrator_id          = "c068f54c-c379-4457-9d84-576d464ef969" # Object_ID of CA_GSD_dba_prd
+    ad_administrator_username    = "dbadmin"
+    sql_version                  = "12.0"             # The version for the new server. Valid values are: 2.0 (for v11 server) and 12.0 (for v12 server).
+    administrator_login_password = var.azsqlms_sql_secret # lookup(lookup(module.key_vault_lookup_synapse_secret.secret_values, "azsqlms-sql-secret"), "value")
+    environment_variables        = module.environment_variables.values 
+    # connection_policy                   = "Default"    #The connection policy the server will use. Possible values are Default, Proxy, and Redirect
+    # public_network_access_enabled       = true         #Whether or not public network access is allowed for this server.
+    # minimum_tls_version                 = "1.2"        #The Minimum TLS Version for all SQL Database and SQL Data Warehouse databases associated with the server. Valid values are: 1.0, 1.1 and 1.2.
+
+    databases = [{ # Databases to add to Sql Server
+        name = lower("${var.app_name}${var.environment}sqldb")
+        #     collation                    = "SQL_Latin1_General_CP1_CI_AS" 
+        #     license_type                 = "BasePrice"
+        #     max_size_gb                  = 2
+        #     read_scale                   = false
+    }]
+
+    existing_storage_account = { # Provide an exisitng storage account for security & audit for SQL Server
+        name                = module.storage_account.name
+        resource_group_name = module.resource_group.name
+    }
+    audit_alert_vulnerability = {
+        name      = "primary"
+        email_ids = ["azsqlmsdba@mife.com"]
+        retention_days = 90
+        alert_policy = "Enabled"
+        recurring_scans_enabled = true
+        email_subscription_admins = false
+    }
+    private_endpoints = [{
+        name            = "${var.app_name}-${var.environment}-sql-endpoint"    # the name of the private endpoint;
+        existing_subnet = var.pe_existing_subnet    
+        private_service_connections = [{
+            name                               = "sql-private-service"         # name of the Private Service Connection;
+            subresource_names                  = ["SQLServer"]                       # (Optional) a list of subresource names that the private endpoint can connect to;
+        }]
+        private_dns_zone_groups = [{
+            name                       = "manulife_core.database.windows.net"
+        }]
+    }]
+      role_assignments = var.sql_contributor
+    #   {[
+    #       "SQL Server Contributor" = [{}]
+    #     #   "SQL Security Manager" = [{}]
+    #     #   "SQL DB Contributor" = [{}]
+    #       }]
+    failover_server = [{ # Primary Server properties will be used unless specified
+        name                = lower("${var.app_name}${var.environment}sqlsec")
+        resource_group_name = module.failover_resource_group_module.name
+        location            = module.failover_resource_group_module.location
+        environment_variables = module.environment_variables.values 
+
+        failover_group = {                 # Failover group values for high availability configuration
+            name = "azsqlmsdlspaas${var.environment}sqlfg" # (Required)  [Read-Write] endpoint failover policy group name.  Must be set if high availability is required.
+            read_write_endpoint_failover_policy_mode          = "Automatic"   # (Optional)  [Read-Write] endpoint failover policy mode.  Must be either Automatic or Manual.  Defaults to standard of Automatic.
+            read_write_endpoint_failover_policy_grace_minutes = 60            # (Optional)  [Read-Write] endpoint failover policy grace minutes.  Only applicable if failover_mode is set to Automatic and is ignored otherwise.  Defaults to 60 minutes.
+            #readonly_endpoint_failover_policy_mode            = ""            # (Optional)  [Read-Only] endpoint failover policy mode.  Can be Enabled or Disabled, or left blank/commented-out for use of the Azure default.
+        }
+        storage_account = {
+            name                  = module.failover_storage_account.name
+            id                    = module.failover_storage_account.id
+            primary_blob_endpoint = module.failover_storage_account.primary_blob_endpoint
+            primary_access_key    = module.failover_storage_account.primary_access_key
+        }
+        audit_alert_vulnerability = {
+            name                      = "secondary"
+            email_ids                 = ["azsqlmsdba@manulife.com"]
+            alert_policy              = "Enabled"
+            retention_days            = 90
+            recurring_scans_enabled   = true
+            email_subscription_admins = false
+        }
+        private_endpoints = [{
+            name            = "${var.app_name}-${var.environment}-sql-sec-endpoint"    # the name of the private endpoint;
+            existing_subnet = {
+                virtual_network_name = "VNET-CAE-azsqlmsDLNAP-Production-PaaS-01"
+                subnet_name          = "PrivateEndPoint-Prod"
+                resource_group_name  = "CAE-azsqlmsDLNAP-Production-network"
+            }    
+            private_service_connections = [{
+                name                               = "sql-sec-private-service"         # name of the Private Service Connection;
+                subresource_names                  = ["SQLServer"]                     # (Optional) a list of subresource names that the private endpoint can connect to;
+            }]
+            private_dns_zone_groups = [{
+                name                       = "mfe_core.database.windows.net"
+            }]
+        }]
+    }]
+}

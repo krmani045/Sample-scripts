@@ -1,0 +1,378 @@
+######################################################################################################
+# A complete EventHub. This resource deploys the following
+# 01. Storage Account
+# 02. EventHub Namespace
+# 03. EventHub 
+# 04. Firewall rules
+# 05. VNET Rules - provided subnets to be added as EventHub Namespace
+# 06. Consumer groups
+# 07. Authorization_rules  
+# 08. Optional Customer Managed Key (CMK)
+# 09. Private Endpoint
+# 10. Diagnostic Settings
+# 11. Role Based Access Control
+######################################################################################################
+provider "azurerm" {
+  features {}
+}
+
+#==================================================================================================
+# The following example defines a EventHub. Most parameters are listed in the example 
+# for reference, but optional ones have been commented out.
+#==================================================================================================
+
+####################################################################################################
+# Module creates a common set of "environment variables" to shared between modules
+####################################################################################################
+module "environment_variables" {
+  source           = "../../templates/modules/tools/environment_variables/v1"
+  environment      = var.general.environment
+  cost_center      = var.general.cost_center
+  application_name = "kafka2azureeh"
+}
+
+####################################################################################################
+# OPTIONAL:: Module generates a name prefix to be used for naming convention as <name_prefix>-<name_suffix>-<##>
+# For more detail please refer to the README.md of the ../tools/name_generator/v1 module.
+####################################################################################################
+# module "name_generator" {
+#   source                = "../templates/modules/tools/name_generator/v1"
+#   environment_variables = module.environment_variables.values
+#   segment_prefix        = var.general.segment_prefix
+#   business_unit         = var.general.business_unit
+#   location              = var.general.location
+# }
+
+###################################################################################################
+# Module to deploy a New Resource Group
+###################################################################################################
+module "resource_group" {
+  source                = "../../templates/modules/common/resource_group/v1"
+  environment_variables = module.environment_variables.values
+  name                  = var.eventhub_storage_account.resource_group_name
+  location              = "canadacentral"
+}
+
+#####################################################################################################
+# OPTIONAL:: Module to deploy a New Storage Account to be used for Event Hubs
+####################################################################################################
+module "storage_account" {
+  source                   = "../../templates/modules/storage/storage_account/v1"
+  name                     = var.eventhub_storage_account.name
+  resource_group_name      = module.resource_group.name
+  location                 = module.resource_group.location
+  account_tier             = "Standard"
+  account_replication_type = "LRS"
+}
+
+######################################################################################################
+# OPTIONAL:: Module to deploy a New Storage Account to be used for EventHub
+#####################################################################################################
+# module "key_vault_lookup" {
+#   source              = "../../../../management_tools/key_vault_lookup/v1"
+#   name                = "nonprod-unittest-akv"
+#   resource_group_name = "unit-testing"
+#   key_names           = ["unittestts-evhkv"]
+# }
+
+# data "azurerm_eventhub_cluster" "existing" {
+#   resource_group_name = "resource group name of the_existing"
+#   name                = "name of the exsitng eventhub_cluster"
+# }
+
+
+module "eventhub_namespace" {
+  source                = "../../templates/modules/analytics/eventhub/v1"
+  environment_variables = module.environment_variables.values
+
+  #----------------------------------------------------
+  # EVENT HUB NAMESPACE
+  #----------------------------------------------------
+  name                          = var.eventhub_namespace.name # (Required) the name to use for this eventhub namespace
+  resource_group_name           = var.eventhub_storage_account.resource_group_name   # the name of the resource group in which the eventhub namespace should be created
+  location                      = var.general.location                              # the Azure Region in which this eventhub namespace should be created
+  sku                           = "Premium"                                   # the name of the sku. Possible values are Basic and Standard
+  # dedicated_cluster_name      = "${module.name_generator.name_prefix}-cluster1" # (Optional) Specifies the name to create a EventHub Dedicated for this Namespace OR Specifies the existing dedicated_cluster_id
+  # dedicated_cluster_id        =   data.azurerm_eventhub_cluster.existing.id   # (Optional) Specifies the ID of the existing EventHub Dedicated Cluster where this Namespace should created
+  capacity                      = 2                           # (Optional) the number of capacity throughput units for a Standard SKU namespace. Valid values range from 1 to 20
+  auto_inflate_enabled          = false                       # (Optional) is auto inflate enabled for this eventhub namespace
+  maximum_throughput_units      = 0                           # (Optional) the maximum number of throughput units when auto inflate is Enabled. Valid values range from 1 to 20
+  zone_redundant                = false                       # (Optional) is eventhub namespace should be zone redundant (created across Availability Zones)
+  public_network_access_enabled = false
+  # key_vault_key_ids        = [lookup(module.key_vault_lookup.key_values, "unittestts-evhkv", null).id] # (Optional) a list of keys of Key Vault for eventhub namespace customer managed key (only available for namespaces created under a Dedicated Cluster).
+
+  authorization_rules = [
+    {
+      name   = "authorization_listen" # (Required) the name of the namespace authorization rule
+      listen = true                   # (Optional) is rule have permissions to listen
+      send   = false                  # (Optional) is rule have permissions to send
+      manage = false                  # (Optional) is rule have permissions to manage the eventhub namespace. ? When this is true both listen and send must be true
+    },
+    {
+      name = "authorization_send"
+      send = true
+    },
+    {
+      name   = "authorization_manage"
+      manage = true
+    }
+  ]
+
+  network_rulesets = {                      # (Optional) A network_rulesets block   
+    default_action                 = "Deny" # (Required) the default action to take when a rule is not matched. valid values are Allow and Deny
+    trusted_service_access_enabled = true   # (Optional) is allow trusted Microsoft services to bypass the firewall
+    
+    # NOTE: At least one of manulife_services, virtual_network_rules or ip_rules must be provided, otherwise Azure will throw an error during provisioning.
+    manulife_services = ["jenkins_ca", "zscaler_ca"]
+    
+    virtual_network_rules = [               # (Optional) One or more virtual_network_rule blocks as defined below. can be specify either subnet_id or existing_subnet
+      {
+        # ignore_missing_virtual_network_service_endpoint = false    # (Optional) Are missing virtual network service endpoints ignored?. Default is false
+        existing_subnet = {                                                # (Required) List of subnets that are allowed to access the eventhub namespace
+          virtual_network_name = "VNET-CAC-Admin_VS-NonProduction-PaaS-01" # the name of the virtual network containing the subnet
+          subnet_name          = "PaaS01"                                  # the name of the subnet
+          resource_group_name  = "CAC-Admin_VS-NonProduction-network"      # (optional) the name of the resource group which contains the virtual network
+        }
+      }
+    ]
+    ip_rules = [
+      {
+        ip_mask = "10.100.0.0/16"
+        action  = "Allow"
+      }
+    ]
+  }
+
+  private_endpoints = [{
+    name = "eventhub-endpoint-1"
+    existing_subnet = {
+      virtual_network_name = "VNET-CAC-Admin_VS-NonProduction-PaaS-01"
+      subnet_name          = "Privateendpoints01"
+      resource_group_name  = "CAC-Admin_VS-NonProduction-network"
+    }
+
+    private_service_connections = [{
+      name              = "eventhub-private-service"
+      subresource_names = ["namespace"]
+    }]
+
+    private_dns_zone_groups = [{
+      name = "manulife_core.servicebus.windows.net"
+      # private_dns_zone_ids = ["/subscriptions/25f7221a-780a-4f98-91db-c4300a397d3e/resourceGroups/unit-testing/providers/Microsoft.Network/privateDnsZones/privatelink.unit.testing.azure.com"]
+    }]
+  }]
+
+  role_assignments = { # (Optional) A role assignments block
+    Contributor = [{
+      user_name      = "app_tcsmigrn_eng"
+      principal_id   = "0afe9aad-4105-4823-9f33-dd3e51ada756"
+      skip_aad_check = false
+    }]
+  #   # "eventhub Service Contributor"   = [{  
+  #   #     user_name        = "svcdcls2@mfcgd.com"
+  #   #     principal_id     = "c01aaeed-f27f-4ec0-8976-abdadfc20ee7"           
+  #   #     skip_aad_check   = false 
+  #   # }]
+  }
+  diagnostic_settings = [{
+    name = var.eventhub_namespace.diagnostic
+
+    shared_event_hub_lookup = {
+      location    = var.general.location
+      environment = var.general.environment
+    }
+
+    logs = [{
+      category = "ArchiveLogs"
+      enabled  = true
+
+      retention_policy = {
+        days    = 30
+        enabled = true
+      }
+    }]
+
+    metrics = [{
+      category = "AllMetrics"
+      enabled  = true
+
+      retention_policy = {
+        days    = 30
+        enabled = true
+      }
+    }]
+  }] 
+
+  #   tags = { # (Optional)  EXAMPLE tags definition to overrite the default common-tags
+  #     CostCenter   = "1234"
+  #     ProductOwner = "CDO"
+  #   }
+
+  #----------------------------------------------------
+  # eventhub 
+  #----------------------------------------------------
+  eventhubs = [
+    {
+      name              = var.eventhubs1.name # (Required) the name of the eventhub
+      partition_count   = 6                                             # (Required) the current number of shards on this eventhub. Maximum 32 for shared parent namespace and 1024 for dedicated EventHubs cluster
+      message_retention = 7                                             # (Required) the number of days to retain the events for this eventhub. Maximun 1 day when for Basic SKU, 7 days for shared parent namespace and 90 days for EventHubs cluster
+      # status = "Active"                       # (Optional) Specifies the status of the Event Hub resource. Possible values are Active, Disabled and SendDisabled. Defaults to Active.
+
+      # capture_description = {    # (Optional) A capture_description block as defined below
+      #   enabled  = true          # (Required) is enabled Capture Description
+      #   encoding = "AvroDeflate" # (Required) the encoding used for the capture description. Possible values are Avro and AvroDeflate
+      #   # interval_in_seconds = 300             # (Optional) the time interval in seconds at which the capture will happen. Values can be between 60 and 900 seconds
+      #   # size_limit_in_bytes = 314572800       # (Optional) the amount of data built up in eventhub before a capture operation occurs. Value should be between 10485760 and 524288000 bytes
+      #   # skip_empty_archives = false           # (Optional) if empty files should not be emitted if no events occur during the Capture time window
+      #   destination = {                                                                                              # (Required) A destination
+      #     name                = "EventHubArchive.AzureBlockBlob"                                                     # (Required) the name of the capture provide . At this time the only supported value is EventHubArchive.AzureBlockBlob.
+      #     archive_name_format = "{Namespace}/{EventHub}/{PartitionId}/{Year}/{Month}/{Day}/{Hour}/{Minute}/{Second}" # (Required) The Blob naming convention for archiving. e.g. {Namespace}/{EventHub}/{PartitionId}/{Year}/{Month}/{Day}/{Hour}/{Minute}/{Second}.
+      #     blob_container_name = "container01a"                                                                       # (Required) the name of the container within the blob storage account.
+      #     storage_account_id  = module.storage_account.id                                                            # (Required) the id of Storage Account or existing_storage_account.
+      #     # existing_storage_account = {   
+      #     #   name                = "nonprodunittestsa"
+      #     #   resource_group_name = "unit-testing"
+      #     # }
+      #   }
+      # }
+
+      consumer_groups = [
+        {
+          name = "webAPI1" # (Required) the name of the eventhub Consumer Group resource
+          # user_metadata = "some-meta-data"    # (Optional) the user metadata
+        },
+        {
+          name = "webApp11"
+        },
+        {
+          name = "webApp12"
+        }
+      ]
+
+      authorization_rules = [
+        {
+          name   = "authorization_listen" # (Required) the name of the eventhub Authorization Rule and only of the permission below 
+          listen = true                   # (Optional) is rule have permissions to listen
+          send   = false                  # (Optional) is rule have permissions to send
+          manage = false                  # (Optional) is rule have permissions to manage the eventhub? When this is true both listen and send must be true
+        },
+        {
+          name = "authorization_send"
+          send = true
+        },
+        {
+          name   = "authorization_manage"
+          manage = true
+        }
+      ]
+    },
+    {
+      name              = var.eventhubs2.name # (Required) the name of the eventhub
+      partition_count   = 1                                             # (Required) the current number of shards on this eventhub. Maximum 32 for shared parent namespace and 1024 for dedicated EventHubs cluster
+      message_retention = 7                                             # (Required) the number of days to retain the events for this eventhub. Maximun 1 day when for Basic SKU, 7 days for shared parent namespace and 90 days for EventHubs cluster
+      # status = "Active"                       # (Optional) Specifies the status of the Event Hub resource. Possible values are Active, Disabled and SendDisabled. Defaults to Active.
+
+      # capture_description = {    # (Optional) A capture_description block as defined below
+      #   enabled  = true          # (Required) is enabled Capture Description
+      #   encoding = "AvroDeflate" # (Required) the encoding used for the capture description. Possible values are Avro and AvroDeflate
+      #   # interval_in_seconds = 300             # (Optional) the time interval in seconds at which the capture will happen. Values can be between 60 and 900 seconds
+      #   # size_limit_in_bytes = 314572800       # (Optional) the amount of data built up in eventhub before a capture operation occurs. Value should be between 10485760 and 524288000 bytes
+      #   # skip_empty_archives = false           # (Optional) if empty files should not be emitted if no events occur during the Capture time window
+      #   destination = {                                                                                              # (Required) A destination
+      #     name                = "EventHubArchive.AzureBlockBlob"                                                     # (Required) the name of the capture provide . At this time the only supported value is EventHubArchive.AzureBlockBlob.
+      #     archive_name_format = "{Namespace}/{EventHub}/{PartitionId}/{Year}/{Month}/{Day}/{Hour}/{Minute}/{Second}" # (Required) The Blob naming convention for archiving. e.g. {Namespace}/{EventHub}/{PartitionId}/{Year}/{Month}/{Day}/{Hour}/{Minute}/{Second}.
+      #     blob_container_name = "container01a"                                                                       # (Required) the name of the container within the blob storage account.
+      #     storage_account_id  = module.storage_account.id                                                            # (Required) the id of Storage Account or existing_storage_account.
+      #     # existing_storage_account = {   
+      #     #   name                = "nonprodunittestsa"
+      #     #   resource_group_name = "unit-testing"
+      #     # }
+      #   }
+      # }
+
+      consumer_groups = [
+        {
+          name = "webAPI1" # (Required) the name of the eventhub Consumer Group resource
+          # user_metadata = "some-meta-data"    # (Optional) the user metadata
+        },
+        {
+          name = "webApp11"
+        },
+        {
+          name = "webApp12"
+        }
+      ]
+
+      authorization_rules = [
+        {
+          name   = "authorization_listen" # (Required) the name of the eventhub Authorization Rule and only of the permission below 
+          listen = true                   # (Optional) is rule have permissions to listen
+          send   = false                  # (Optional) is rule have permissions to send
+          manage = false                  # (Optional) is rule have permissions to manage the eventhub? When this is true both listen and send must be true
+        },
+        {
+          name = "authorization_send"
+          send = true
+        },
+        {
+          name   = "authorization_manage"
+          manage = true
+        }
+      ]
+    },
+    {
+      name              = var.eventhubs3.name # (Required) the name of the eventhub
+      partition_count   = 1                                             # (Required) the current number of shards on this eventhub. Maximum 32 for shared parent namespace and 1024 for dedicated EventHubs cluster
+      message_retention = 7                                             # (Required) the number of days to retain the events for this eventhub. Maximun 1 day when for Basic SKU, 7 days for shared parent namespace and 90 days for EventHubs cluster
+      # status = "Active"                       # (Optional) Specifies the status of the Event Hub resource. Possible values are Active, Disabled and SendDisabled. Defaults to Active.
+
+      # capture_description = {    # (Optional) A capture_description block as defined below
+      #   enabled  = true          # (Required) is enabled Capture Description
+      #   encoding = "AvroDeflate" # (Required) the encoding used for the capture description. Possible values are Avro and AvroDeflate
+      #   # interval_in_seconds = 300             # (Optional) the time interval in seconds at which the capture will happen. Values can be between 60 and 900 seconds
+      #   # size_limit_in_bytes = 314572800       # (Optional) the amount of data built up in eventhub before a capture operation occurs. Value should be between 10485760 and 524288000 bytes
+      #   # skip_empty_archives = false           # (Optional) if empty files should not be emitted if no events occur during the Capture time window
+      #   destination = {                                                                                              # (Required) A destination
+      #     name                = "EventHubArchive.AzureBlockBlob"                                                     # (Required) the name of the capture provide . At this time the only supported value is EventHubArchive.AzureBlockBlob.
+      #     archive_name_format = "{Namespace}/{EventHub}/{PartitionId}/{Year}/{Month}/{Day}/{Hour}/{Minute}/{Second}" # (Required) The Blob naming convention for archiving. e.g. {Namespace}/{EventHub}/{PartitionId}/{Year}/{Month}/{Day}/{Hour}/{Minute}/{Second}.
+      #     blob_container_name = "container01a"                                                                       # (Required) the name of the container within the blob storage account.
+      #     storage_account_id  = module.storage_account.id                                                            # (Required) the id of Storage Account or existing_storage_account.
+      #     # existing_storage_account = {   
+      #     #   name                = "nonprodunittestsa"
+      #     #   resource_group_name = "unit-testing"
+      #     # }
+      #   }
+      # }
+
+      consumer_groups = [
+        {
+          name = "webAPI1" # (Required) the name of the eventhub Consumer Group resource
+          # user_metadata = "some-meta-data"    # (Optional) the user metadata
+        },
+        {
+          name = "webApp11"
+        },
+        {
+          name = "webApp12"
+        }
+      ]
+
+      authorization_rules = [
+        {
+          name   = "authorization_listen" # (Required) the name of the eventhub Authorization Rule and only of the permission below 
+          listen = true                   # (Optional) is rule have permissions to listen
+          send   = false                  # (Optional) is rule have permissions to send
+          manage = false                  # (Optional) is rule have permissions to manage the eventhub? When this is true both listen and send must be true
+        },
+        {
+          name = "authorization_send"
+          send = true
+        },
+        {
+          name   = "authorization_manage"
+          manage = true
+        }
+      ]
+    } 
+  ]
+}
